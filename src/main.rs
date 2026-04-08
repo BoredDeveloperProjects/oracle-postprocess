@@ -1,12 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::{env, time::Instant};
 
-mod compiled;
-mod decompiler;
-mod rbxlx;
-
-use decompiler::Decompiler;
-use rbxlx::process_rbxlx_file;
+use oracle_postprocess::{compiled, decompiler::Decompiler, rbxlx::process_rbxlx_file};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -54,31 +49,18 @@ enum Commands {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let key = {
-        let env = env::var("ORACLE_KEY").ok();
-        let arg = args.key;
-        match arg.or(env) {
-            Some(key) => key,
-            None => {
-                return Err(format!(
-                    "oracle key not provided. try `{} help`",
-                    env::args().next().unwrap()
-                )
-                .into());
-            }
-        }
-    };
-
-    let decompiler = Decompiler::new(&args.base_url, &key).await?;
-
     let processing_start = Instant::now();
 
-    match &args.command {
+    match args.command {
         Some(Commands::Rbxlx { input, output }) => {
-            process_rbxlx_file(&decompiler, input, output).await?;
+            let key = resolve_key(args.key)?;
+            let decompiler = Decompiler::new(&args.base_url, &key).await?;
+            process_rbxlx_file(&decompiler, &input, &output).await?;
         }
         Some(Commands::Single { input, output }) => {
-            let (bytecode, header) = compiled::get_bytecode_from_file(input)?;
+            let (bytecode, header) = compiled::get_bytecode_from_file(&input)?;
+            let key = resolve_key(args.key)?;
+            let decompiler = Decompiler::new(&args.base_url, &key).await?;
             let mut result = decompiler.decompile_single(&bytecode).await??;
 
             if let Some(header) = header {
@@ -92,8 +74,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    drop(decompiler);
-
     println!("time: {:?}", processing_start.elapsed());
     Ok(())
+}
+
+fn resolve_key(arg_key: Option<String>) -> Result<String, Box<dyn std::error::Error>> {
+    match arg_key.or_else(|| env::var("ORACLE_KEY").ok()) {
+        Some(key) => Ok(key),
+        None => Err(format!(
+            "oracle key not provided. try `{} help`",
+            env::args().next().unwrap_or_else(|| "oracle-postprocess".to_string())
+        )
+        .into()),
+    }
 }

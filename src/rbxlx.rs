@@ -1,17 +1,21 @@
-use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
 
 use sha2::{Digest, Sha256};
-use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
 use tokio::sync::{mpsc, oneshot};
 use xml::reader::{EventReader, XmlEvent};
 use xml::writer::{EmitterConfig, XmlEvent as WriteXmlEvent};
 
+use crate::bytecode::extract_embedded_bytecode;
 use crate::decompiler::{DecompilationRequest, Decompiler};
+
+const IO_BUFFER_CAPACITY: usize = 8 * 1024 * 1024;
+const WRITE_CHANNEL_CAPACITY: usize = 256;
+const REPLACEMENT_CHARACTER: &[u8] = &[0xef, 0xbf, 0xbd];
 
 enum ToWrite {
     XmlEvent(XmlEvent),
@@ -25,7 +29,9 @@ enum ToWrite {
 struct Utf8BoundaryReader<R: Read> {
     inner: R,
     pending: Vec<u8>,
-    output: VecDeque<u8>,
+    pending_start: usize,
+    output: Vec<u8>,
+    output_start: usize,
     eof: bool,
 }
 
@@ -33,8 +39,10 @@ impl<R: Read> Utf8BoundaryReader<R> {
     fn new(inner: R) -> Self {
         Self {
             inner,
-            pending: Vec::new(),
-            output: VecDeque::new(),
+            pending: Vec::with_capacity(64 * 1024),
+            pending_start: 0,
+            output: Vec::with_capacity(64 * 1024),
+            output_start: 0,
             eof: false,
         }
     }
@@ -43,6 +51,8 @@ impl<R: Read> Utf8BoundaryReader<R> {
         if self.eof {
             return Ok(());
         }
+
+        self.compact_pending();
 
         let mut buf = [0u8; 64 * 1024];
         let read = self.inner.read(&mut buf)?;
@@ -57,37 +67,90 @@ impl<R: Read> Utf8BoundaryReader<R> {
 
     fn process_pending(&mut self) -> io::Result<()> {
         loop {
-            if self.pending.is_empty() {
+            let pending_len = self.pending_slice().len();
+            if pending_len == 0 {
                 return Ok(());
             }
 
-            fn is_xml_valid(b: &u8) -> bool {
-                *b >= 0x20 || *b == 0x09 || *b == 0x0A || *b == 0x0D
-            }
-
-            match std::str::from_utf8(&self.pending) {
+            match std::str::from_utf8(self.pending_slice()) {
                 Ok(_) => {
-                    self.output.extend(self.pending.drain(..).filter(is_xml_valid));
+                    self.append_pending_xml_bytes(pending_len);
+                    self.consume_pending(pending_len);
                     return Ok(());
                 }
-                Err(err) => {
-                    let valid_up_to = err.valid_up_to();
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
                     if valid_up_to > 0 {
-                        self.output.extend(self.pending.drain(..valid_up_to).filter(is_xml_valid));
+                        self.append_pending_xml_bytes(valid_up_to);
+                        self.consume_pending(valid_up_to);
                         return Ok(());
                     }
 
-                    if err.error_len().is_none() && !self.eof {
+                    if error.error_len().is_none() && !self.eof {
                         self.fill_pending()?;
                         continue;
                     }
 
-                    let invalid_len = err.error_len().unwrap_or(1).min(self.pending.len());
-                    self.pending.drain(..invalid_len);
-                    self.output.extend([0xef, 0xbf, 0xbd]);
+                    let invalid_len = error.error_len().unwrap_or(1).min(pending_len);
+                    self.consume_pending(invalid_len);
+                    self.output.extend_from_slice(REPLACEMENT_CHARACTER);
                     return Ok(());
                 }
             }
+        }
+    }
+
+    fn pending_slice(&self) -> &[u8] {
+        &self.pending[self.pending_start..]
+    }
+
+    fn append_pending_xml_bytes(&mut self, len: usize) {
+        let start = self.pending_start;
+        let end = start + len;
+        self.output.reserve(len);
+        for &byte in &self.pending[start..end] {
+            if is_xml_valid(byte) {
+                self.output.push(byte);
+            }
+        }
+    }
+
+    fn consume_pending(&mut self, count: usize) {
+        self.pending_start += count;
+        if self.pending_start >= self.pending.len() {
+            self.pending.clear();
+            self.pending_start = 0;
+        } else {
+            self.compact_pending();
+        }
+    }
+
+    fn compact_pending(&mut self) {
+        if self.pending_start == 0 {
+            return;
+        }
+
+        if self.pending_start >= self.pending.len() {
+            self.pending.clear();
+            self.pending_start = 0;
+            return;
+        }
+
+        if self.pending_start >= 4096 || self.pending_start * 2 >= self.pending.len() {
+            self.pending.drain(..self.pending_start);
+            self.pending_start = 0;
+        }
+    }
+
+    fn output_slice(&self) -> &[u8] {
+        &self.output[self.output_start..]
+    }
+
+    fn consume_output(&mut self, count: usize) {
+        self.output_start += count;
+        if self.output_start >= self.output.len() {
+            self.output.clear();
+            self.output_start = 0;
         }
     }
 }
@@ -98,28 +161,22 @@ impl<R: Read> Read for Utf8BoundaryReader<R> {
             return Ok(0);
         }
 
-        while self.output.is_empty() {
-            if self.pending.is_empty() && !self.eof {
+        while self.output_slice().is_empty() {
+            if self.pending_slice().is_empty() && !self.eof {
                 self.fill_pending()?;
             }
 
-            if self.pending.is_empty() && self.eof {
+            if self.pending_slice().is_empty() && self.eof {
                 return Ok(0);
             }
 
             self.process_pending()?;
         }
 
-        let mut written = 0usize;
-        while written < out.len() {
-            match self.output.pop_front() {
-                Some(b) => {
-                    out[written] = b;
-                    written += 1;
-                }
-                None => break,
-            }
-        }
+        let available = self.output_slice();
+        let written = available.len().min(out.len());
+        out[..written].copy_from_slice(&available[..written]);
+        self.consume_output(written);
 
         Ok(written)
     }
@@ -134,117 +191,50 @@ pub async fn process_rbxlx_file(
     let decompiled_count = Arc::new(AtomicU32::new(0));
     let total_events = Arc::new(AtomicU32::new(0));
     let written_events = Arc::new(AtomicU32::new(0));
-    let reader_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_done = Arc::new(AtomicBool::new(false));
 
-    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<ToWrite>();
+    let (write_tx, mut write_rx) = mpsc::channel::<ToWrite>(WRITE_CHANNEL_CAPACITY);
     let decompiled_count_clone = decompiled_count.clone();
     let written_events_clone = written_events.clone();
-    let output_file = output_file.to_string();
+    let output_path = output_file.to_string();
     let writer_handle = tokio::spawn(async move {
-        let file = File::create(&output_file).expect("failed to create output file");
-        let mut buf_writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
+        let file = File::create(&output_path)?;
+        let mut buf_writer = BufWriter::with_capacity(IO_BUFFER_CAPACITY, file);
         let mut writer = EmitterConfig::new()
+            .write_document_declaration(false)
             .create_writer(&mut buf_writer);
 
         while let Some(task) = write_rx.recv().await {
             match task {
-                ToWrite::XmlEvent(e) => {
-                    match e {
-                        XmlEvent::StartElement { name, attributes, .. } => {
-                            use xml::name::Name;
-                            let local_name_str = name.local_name.as_str();
-                            let elem_name = Name::local(local_name_str);
-                            let builder = WriteXmlEvent::start_element(elem_name);
-                            if attributes.is_empty() {
-                                if let Err(e) = writer.write(builder) {
-                                    panic!("Write error: {e}");
-                                }
-                            } else {
-                                let final_builder = attributes.iter().fold(builder, |b, attr| {
-                                    let attr_name = Name::local(attr.name.local_name.as_str());
-                                    b.attr(attr_name, &attr.value)
-                                });
-                                if let Err(e) = writer.write(final_builder) {
-                                    panic!("Write error: {e}");
-                                }
-                            }
-                        }
-                        XmlEvent::EndElement { name: _ } => {
-                            if let Err(e) = writer.write(WriteXmlEvent::end_element()) {
-                                panic!("Write error: {e}");
-                            }
-                        }
-                        XmlEvent::CData(text) => {
-                            let text_owned = text.clone();
-                            if let Err(e) = writer.write(WriteXmlEvent::cdata(&text_owned)) {
-                                panic!("Write error: {e}");
-                            }
-                        }
-                        XmlEvent::Characters(text) => {
-                            let text_owned = text.clone();
-                            if let Err(e) = writer.write(WriteXmlEvent::characters(&text_owned)) {
-                                panic!("Write error: {e}");
-                            }
-                        }
-                        XmlEvent::Comment(text) => {
-                            let text_owned = text.clone();
-                            if let Err(e) = writer.write(WriteXmlEvent::comment(&text_owned)) {
-                                panic!("Write error: {e}");
-                            }
-                        }
-                        XmlEvent::ProcessingInstruction { .. } | XmlEvent::StartDocument { .. } => {
-                            written_events_clone.fetch_add(1, Ordering::Relaxed);
-                            continue
-                        }
-                        _ => {
-                            println!("unknownevent: {:?}", e);
-                            written_events_clone.fetch_add(1, Ordering::Relaxed);
-                            continue
-                        }
-                    }
-                }
-                ToWrite::DecompilationResult {
-                    header,
-                    bytecode,
-                    rx,
-                } => {
+                ToWrite::XmlEvent(event) => write_xml_event(&mut writer, event)?,
+                ToWrite::DecompilationResult { header, bytecode, rx } => {
                     let result = match rx.await {
-                        Ok(it) => it,
-                        Err(_) => {
-                            eprintln!("error: decompilation response never received (sender dropped)");
-                            Err("oracle-postprocess error: sender dropped".to_string())
-                        }
+                        Ok(response) => response,
+                        Err(_) => Err("oracle-postprocess error: sender dropped".to_string()),
                     };
-                    let result = match result {
-                        Ok(it) => format!("-- decompilation:\n{}", it),
-                        Err(it) => format!("-- decompilation failed:\n-- {}", it),
-                    };
-                    let formatted_result = format!("{}{}\n\n{}\n", header, bytecode, result);
-                    let escaped_result = formatted_result.replace("]]>", "]]]]><![CDATA[>");
-                    let event = WriteXmlEvent::cdata(&escaped_result);
 
+                    let formatted_result = build_decompiled_cdata(&header, &bytecode, result);
                     decompiled_count_clone.fetch_add(1, Ordering::Relaxed);
-                    if let Err(e) = writer.write(event) {
-                        panic!("Write error: {e}");
-                    }
+                    writer.write(WriteXmlEvent::cdata(&formatted_result))?;
                 }
             }
+
             written_events_clone.fetch_add(1, Ordering::Relaxed);
         }
 
-        if let Err(e) = buf_writer.flush() {
-            println!("couldnt flush buffer: {:?}", e);
+        buf_writer.flush()?;
+
+        if let Ok(metadata) = std::fs::metadata(&output_path) {
+            println!("wrote {} KiB to {}", metadata.len() / 1024, output_path);
+        } else {
+            println!("wrote output file to {}", output_path);
         }
 
-        if let Ok(metadata) = std::fs::metadata(&output_file) {
-            println!("wrote {} KiB to {}", metadata.len() / 1024, output_file);
-        } else {
-            println!("wrote output file to {}", output_file);
-        }
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     });
 
     let decompiled_count_clone = decompiled_count.clone();
-    let total_scripts_clone_progress = total_scripts.clone();
+    let total_scripts_clone = total_scripts.clone();
     let total_events_clone = total_events.clone();
     let written_events_clone = written_events.clone();
     let reader_done_clone = reader_done.clone();
@@ -253,7 +243,7 @@ pub async fn process_rbxlx_file(
         loop {
             interval.tick().await;
             let decompiled = decompiled_count_clone.load(Ordering::Relaxed);
-            let total = total_scripts_clone_progress.load(Ordering::Relaxed);
+            let total = total_scripts_clone.load(Ordering::Relaxed);
             let total_ev = total_events_clone.load(Ordering::Relaxed);
             let written_ev = written_events_clone.load(Ordering::Relaxed);
             let is_reader_done = reader_done_clone.load(Ordering::Relaxed);
@@ -271,91 +261,71 @@ pub async fn process_rbxlx_file(
                 }
             }
 
-            if is_reader_done && written_ev >= total_ev && total_ev > 0 {
+            if is_reader_done && (total_ev == 0 || written_ev >= total_ev) {
                 break;
             }
         }
     });
 
     let input_file_handle = File::open(input_file)?;
-    let file = BufReader::with_capacity(8 * 1024 * 1024, input_file_handle);
+    let file = BufReader::with_capacity(IO_BUFFER_CAPACITY, input_file_handle);
     let utf8_reader = Utf8BoundaryReader::new(file);
     let parser = EventReader::new(utf8_reader);
 
     let mut event_count = 0u64;
-    for e in parser {
+    for event in parser {
         event_count += 1;
-        match e {
+        match event {
             Ok(XmlEvent::CData(cdata_string)) => {
                 total_events.fetch_add(1, Ordering::Relaxed);
-                let (dec_tx, dec_rx) = oneshot::channel::<Result<String, String>>();
 
-                let bytecode_start_lf = "-- Bytecode (Base64):\n-- ";
-                let bytecode_start_crlf = "-- Bytecode (Base64):\r\n-- ";
-                
-                let bytecode_position = cdata_string
-                    .find(bytecode_start_lf)
-                    .map(|it| it + bytecode_start_lf.len())
-                    .or_else(|| cdata_string
-                        .find(bytecode_start_crlf)
-                        .map(|it| it + bytecode_start_crlf.len()));
-
-                let Some(position) = bytecode_position else {
-                    write_tx
-                        .send(ToWrite::XmlEvent(XmlEvent::CData(cdata_string)))
-                        .unwrap();
+                let Some(embedded) = extract_embedded_bytecode(&cdata_string) else {
+                    send_write_task(&write_tx, ToWrite::XmlEvent(XmlEvent::CData(cdata_string))).await?;
                     continue;
                 };
 
                 total_scripts.fetch_add(1, Ordering::Relaxed);
 
-                let bytecode_end = cdata_string[position..]
-                    .find(|c| c == '\n' || c == '\r')
-                    .map(|idx| position + idx)
-                    .unwrap_or(cdata_string.len());
-
-                let header = cdata_string[..position].to_string();
-                let bytecode = &cdata_string[position..bytecode_end];
-
-                let bytecode_hash = format!("{:x}", Sha256::digest(bytecode.as_bytes()));
-                let bytecode_len = bytecode.len() as u32;
-
-                let bytecode: Arc<str> = Arc::from(bytecode);
-
+                let header = embedded.header.to_owned();
+                let bytecode: Arc<str> = Arc::from(embedded.bytecode);
+                let (dec_tx, dec_rx) = oneshot::channel::<Result<String, String>>();
                 let request = DecompilationRequest {
                     bytecode: bytecode.clone(),
-                    bytecode_hash,
-                    bytecode_len,
+                    bytecode_hash: format!("{:x}", Sha256::digest(bytecode.as_bytes())),
+                    bytecode_len: bytecode.len() as u32,
                     tx: dec_tx,
                 };
 
-                decompiler.decompile_batch(vec![request]).await.unwrap();
-                write_tx
-                    .send(ToWrite::DecompilationResult {
+                decompiler.enqueue_request(request).await?;
+                send_write_task(
+                    &write_tx,
+                    ToWrite::DecompilationResult {
                         header,
                         bytecode,
                         rx: dec_rx,
-                    })
-                    .unwrap();
+                    },
+                )
+                .await?;
             }
-            Ok(e) => {
+            Ok(xml_event) => {
                 total_events.fetch_add(1, Ordering::Relaxed);
-                write_tx.send(ToWrite::XmlEvent(e)).unwrap();
+                send_write_task(&write_tx, ToWrite::XmlEvent(xml_event)).await?;
             }
-            Err(e) => {
-                eprintln!("xml parsing error at event #{}: {e}", event_count);
-                return Err(e.into());
+            Err(error) => {
+                eprintln!("xml parsing error at event #{}: {error}", event_count);
+                return Err(error.into());
             }
         }
     }
 
-    // and now we wait for the decompiler
-    // to do its thing
     reader_done.store(true, Ordering::Relaxed);
     progress_handle.await?;
-    // and now the decompiler has done its thing
     drop(write_tx);
-    writer_handle.await?;
+
+    let writer_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = writer_handle.await?;
+    if let Err(error) = writer_result {
+        return Err(error.to_string().into());
+    }
 
     if total_scripts.load(Ordering::Relaxed) == 0 {
         println!("no scripts found to decompile");
@@ -363,3 +333,109 @@ pub async fn process_rbxlx_file(
 
     Ok(())
 }
+
+async fn send_write_task(
+    write_tx: &mpsc::Sender<ToWrite>,
+    task: ToWrite,
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_tx.send(task).await.map_err(|_| {
+        Box::new(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "writer task exited unexpectedly",
+        )) as Box<dyn std::error::Error>
+    })
+}
+
+fn write_xml_event<W: Write>(
+    writer: &mut xml::writer::EventWriter<W>,
+    event: XmlEvent,
+) -> Result<(), xml::writer::Error> {
+    match event {
+        XmlEvent::StartElement {
+            name, attributes, ..
+        } => {
+            use xml::name::Name;
+
+            let mut builder = WriteXmlEvent::start_element(Name::local(name.local_name.as_str()));
+            for attribute in &attributes {
+                builder = builder.attr(
+                    Name::local(attribute.name.local_name.as_str()),
+                    attribute.value.as_str(),
+                );
+            }
+            writer.write(builder)?;
+        }
+        XmlEvent::EndElement { .. } => writer.write(WriteXmlEvent::end_element())?,
+        XmlEvent::CData(text) => writer.write(WriteXmlEvent::cdata(&text))?,
+        XmlEvent::Characters(text) => writer.write(WriteXmlEvent::characters(&text))?,
+        XmlEvent::Comment(text) => writer.write(WriteXmlEvent::comment(&text))?,
+        XmlEvent::ProcessingInstruction { .. } | XmlEvent::StartDocument { .. } | XmlEvent::EndDocument => {}
+        other => println!("unknownevent: {:?}", other),
+    }
+
+    Ok(())
+}
+
+fn build_decompiled_cdata(
+    header: &str,
+    bytecode: &str,
+    result: Result<String, String>,
+) -> String {
+    let body_len = match &result {
+        Ok(text) => text.len(),
+        Err(text) => text.len(),
+    };
+
+    let mut output = String::with_capacity(header.len() + bytecode.len() + body_len + 64);
+    push_cdata_escaped(&mut output, header);
+    push_cdata_escaped(&mut output, bytecode);
+    push_cdata_escaped(&mut output, "\n\n");
+
+    match result {
+        Ok(text) => {
+            push_cdata_escaped(&mut output, "-- decompilation:\n");
+            push_cdata_escaped(&mut output, &text);
+        }
+        Err(text) => {
+            push_cdata_escaped(&mut output, "-- decompilation failed:\n-- ");
+            push_cdata_escaped(&mut output, &text);
+        }
+    }
+
+    push_cdata_escaped(&mut output, "\n");
+    output
+}
+
+fn push_cdata_escaped(output: &mut String, input: &str) {
+    let mut start = 0;
+    while let Some(position) = input[start..].find("]]>") {
+        let absolute = start + position;
+        output.push_str(&input[start..absolute]);
+        output.push_str("]]]]><![CDATA[>");
+        start = absolute + 3;
+    }
+    output.push_str(&input[start..]);
+}
+
+fn is_xml_valid(byte: u8) -> bool {
+    byte >= 0x20 || byte == b'\t' || byte == b'\n' || byte == b'\r'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_decompiled_cdata;
+
+    #[test]
+    fn escapes_cdata_end_markers_in_decompiled_output() {
+        let output = build_decompiled_cdata(
+            "-- Bytecode (Base64):\n-- ",
+            "QUJD",
+            Ok("print(\"]]> inside\")".to_string()),
+        );
+
+        assert!(output.contains("]]]]><![CDATA[>"));
+        assert!(output.contains("-- decompilation:\nprint("));
+    }
+}
+
+

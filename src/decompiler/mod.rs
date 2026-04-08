@@ -1,13 +1,11 @@
 use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
+    collections::{HashMap, VecDeque},
+    future::pending,
+    sync::Arc,
 };
 
-use futures::{SinkExt, StreamExt};
-use serde_derive::{Deserialize, Serialize};
+use futures::{Sink, SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Error as TungsteniteError;
@@ -21,16 +19,16 @@ use crate::decompiler::options::DecompileOptions;
 
 mod options;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(tag = "type")]
-enum WebsocketServerboundMessage {
+enum WebsocketServerboundMessage<'a> {
     #[serde(rename = "decompile")]
-    Decompile { data: Vec<String> },
+    Decompile { data: Vec<&'a str> },
     // i dont care about this thing existing!
     // users, however, might!
     #[allow(dead_code)]
     #[serde(rename = "options")]
-    Options { options: DecompileOptions },
+    Options { options: &'a DecompileOptions },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -52,11 +50,32 @@ pub struct DecompilationRequest {
 }
 
 pub struct Decompiler {
-    decompile_tx: mpsc::UnboundedSender<DecompilationRequest>,
+    decompile_tx: mpsc::Sender<DecompilationRequest>,
     _websocket_handle: tokio::task::JoinHandle<()>,
 }
 
 const MAX_BYTES_IN_FLIGHT: u32 = 8 * 1024 * 1024; // 8 mib
+const REQUEST_CHANNEL_CAPACITY: usize = 512;
+
+type DecompilationResponse = Result<String, String>;
+
+struct PendingRequestGroup {
+    waiters: Vec<oneshot::Sender<DecompilationResponse>>,
+    byte_size: u32,
+}
+
+struct QueuedRequestGroup {
+    bytecode: Arc<str>,
+    bytecode_len: u32,
+    waiters: Vec<oneshot::Sender<DecompilationResponse>>,
+}
+
+struct BatchRequestGroup {
+    hash: String,
+    bytecode: Arc<str>,
+    bytecode_len: u32,
+    waiters: Vec<oneshot::Sender<DecompilationResponse>>,
+}
 
 impl Decompiler {
     pub async fn new(endpoint: &str, auth_token: &str) -> Result<Self, Box<dyn std::error::Error>> {
@@ -84,7 +103,7 @@ impl Decompiler {
             }
         };
 
-        let (decompile_tx, decompile_rx) = mpsc::unbounded_channel::<DecompilationRequest>();
+        let (decompile_tx, decompile_rx) = mpsc::channel::<DecompilationRequest>(REQUEST_CHANNEL_CAPACITY);
         let websocket_handle = tokio::spawn(Self::websocket_handler(ws_stream, decompile_rx));
 
         Ok(Self {
@@ -95,19 +114,40 @@ impl Decompiler {
 
     async fn websocket_handler(
         ws_stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-        mut decompile_rx: mpsc::UnboundedReceiver<DecompilationRequest>,
+        mut decompile_rx: mpsc::Receiver<DecompilationRequest>,
     ) {
-        let bytes_in_flight = Arc::new(AtomicU32::new(0));
         let (mut write, mut read) = ws_stream.split();
 
-        let mut pending_requests: HashMap<String, (Vec<DecompilationRequest>, u32)> =
-            HashMap::new();
-        let mut queued_requests: Vec<DecompilationRequest> = Vec::new();
+        let mut bytes_in_flight = 0u32;
+        let mut pending_requests: HashMap<String, PendingRequestGroup> = HashMap::new();
+        let mut queued_order = VecDeque::new();
+        let mut queued_requests: HashMap<String, QueuedRequestGroup> = HashMap::new();
 
         let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
         ping_interval.tick().await;
+        let mut input_closed = false;
 
         loop {
+            if let Err(error) = Self::flush_queued_requests(
+                &mut write,
+                &mut bytes_in_flight,
+                &mut queued_order,
+                &mut queued_requests,
+                &mut pending_requests,
+            )
+            .await
+            {
+                eprintln!(
+                    "error: failed to send websocket message (connection lost): {}",
+                    error
+                );
+                std::process::exit(1);
+            }
+
+            if input_closed && pending_requests.is_empty() && queued_order.is_empty() {
+                break;
+            }
+
             tokio::select! {
                 _ = ping_interval.tick() => {
                     if let Err(e) = write.send(Message::Ping(Bytes::from_static(b"ping"))).await {
@@ -140,99 +180,169 @@ impl Decompiler {
 
                     let WebsocketClientboundMessage::DecompilationResult { success, data, input_hash } = response;
 
-                    let Some((requests, byte_size)) = pending_requests.remove(&input_hash) else { continue; };
-
-                    bytes_in_flight.fetch_sub(byte_size, Ordering::Relaxed);
-
-                    let result = if success {
-                        Ok(data)
-                    } else {
-                        Err(data)
+                    let Some(pending_group) = pending_requests.remove(input_hash.as_str()) else {
+                        continue;
                     };
 
-                    for request in requests {
-                        // If the receiver was dropped, just ignore it
-                        let _ = request.tx.send(result.clone());
-                    }
-
-                    // try to send queued requests now that we have space
-                    let mut remaining_queue = Vec::with_capacity(queued_requests.len());
-                    while let Some(queued_request) = queued_requests.pop() {
-                        let current_bytes = bytes_in_flight.load(Ordering::Relaxed);
-
-                        if current_bytes + queued_request.bytecode_len > MAX_BYTES_IN_FLIGHT {
-                            remaining_queue.push(queued_request);
-                            continue;
-                        }
-
-                        let message = serde_json::to_string(&WebsocketServerboundMessage::Decompile {
-                            data: vec![queued_request.bytecode.to_string()]
-                        }).unwrap();
-
-                        if let Err(e) = write.send(Message::Text(message.into())).await {
-                            eprintln!("error: failed to send websocket message (connection lost): {}", e);
-                            std::process::exit(1);
-                        }
-
-                        bytes_in_flight.fetch_add(queued_request.bytecode_len, Ordering::Relaxed);
-                        let bytecode_len = queued_request.bytecode_len;
-                        
-                        // Check if there's already a pending request for this hash (from duplicate)
-                        if let Some((existing_requests, _)) = pending_requests.get_mut(&queued_request.bytecode_hash) {
-                            existing_requests.push(queued_request);
-                        } else {
-                            pending_requests.insert(
-                                queued_request.bytecode_hash.clone(),
-                                (vec![queued_request], bytecode_len)
-                            );
-                        }
-                    }
-                    queued_requests = remaining_queue;
+                    bytes_in_flight = bytes_in_flight.saturating_sub(pending_group.byte_size);
+                    Self::complete_waiters(
+                        pending_group.waiters,
+                        if success { Ok(data) } else { Err(data) },
+                    );
                 }
-                decompile_request = decompile_rx.recv() => {
-                    let Some(request) = decompile_request else {
-                        // channel closed, check if we can exit
-                        if pending_requests.is_empty() && queued_requests.is_empty() {
-                            break;
-                        }
-                        continue;
-                    };
-
-                    // check if there's already a pending request for this script hash
-                    if let Some((existing_requests, _)) = pending_requests.get_mut(&request.bytecode_hash) {
-                        existing_requests.push(request);
-                        continue;
+                decompile_request = async {
+                    if input_closed {
+                        pending::<Option<DecompilationRequest>>().await
+                    } else {
+                        decompile_rx.recv().await
                     }
-
-                    // check if single request exceeds limit
-                    if request.bytecode_len > MAX_BYTES_IN_FLIGHT {
-                        request.tx.send(Err(format!("bytecode too large ({:.2} mb) exceeds 8mb limit",
-                            request.bytecode_len as f64 / 1024.0 / 1024.0))).unwrap();
-                        continue;
+                } => {
+                    match decompile_request {
+                        Some(request) => Self::queue_request(
+                            request,
+                            &mut pending_requests,
+                            &mut queued_order,
+                            &mut queued_requests,
+                        ),
+                        None => input_closed = true,
                     }
-
-                    let current_bytes = bytes_in_flight.load(Ordering::Relaxed);
-
-                    if current_bytes + request.bytecode_len > MAX_BYTES_IN_FLIGHT {
-                        queued_requests.push(request);
-                        continue;
-                    }
-
-                    let message = serde_json::to_string(&WebsocketServerboundMessage::Decompile {
-                        data: vec![request.bytecode.to_string()]
-                    }).unwrap();
-
-                    if let Err(e) = write.send(Message::Text(message.into())).await {
-                        eprintln!("error: failed to send websocket message (connection lost): {}", e);
-                        std::process::exit(1);
-                    }
-
-                    bytes_in_flight.fetch_add(request.bytecode_len, Ordering::Relaxed);
-                    let bytecode_len = request.bytecode_len;
-                    pending_requests.insert(request.bytecode_hash.clone(), (vec![request], bytecode_len));
                 }
             }
         }
+    }
+
+    fn queue_request(
+        request: DecompilationRequest,
+        pending_requests: &mut HashMap<String, PendingRequestGroup>,
+        queued_order: &mut VecDeque<String>,
+        queued_requests: &mut HashMap<String, QueuedRequestGroup>,
+    ) {
+        if request.bytecode_len > MAX_BYTES_IN_FLIGHT {
+            let _ = request.tx.send(Err(format!(
+                "bytecode too large ({:.2} mb) exceeds 8mb limit",
+                request.bytecode_len as f64 / 1024.0 / 1024.0
+            )));
+            return;
+        }
+
+        if let Some(existing_request) = pending_requests.get_mut(&request.bytecode_hash) {
+            existing_request.waiters.push(request.tx);
+            return;
+        }
+
+        if let Some(existing_request) = queued_requests.get_mut(&request.bytecode_hash) {
+            existing_request.waiters.push(request.tx);
+            return;
+        }
+
+        queued_order.push_back(request.bytecode_hash.clone());
+        queued_requests.insert(
+            request.bytecode_hash,
+            QueuedRequestGroup {
+                bytecode: request.bytecode,
+                bytecode_len: request.bytecode_len,
+                waiters: vec![request.tx],
+            },
+        );
+    }
+
+    async fn flush_queued_requests<W>(
+        write: &mut W,
+        bytes_in_flight: &mut u32,
+        queued_order: &mut VecDeque<String>,
+        queued_requests: &mut HashMap<String, QueuedRequestGroup>,
+        pending_requests: &mut HashMap<String, PendingRequestGroup>,
+    ) -> Result<(), TungsteniteError>
+    where
+        W: Sink<Message, Error = TungsteniteError> + Unpin,
+    {
+        let available_bytes = MAX_BYTES_IN_FLIGHT.saturating_sub(*bytes_in_flight);
+        if available_bytes == 0 || queued_order.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0u32;
+
+        while let Some(next_hash) = queued_order.front() {
+            let next_request = queued_requests
+                .get(next_hash)
+                .expect("queued order and queued request map out of sync");
+
+            if batch_bytes + next_request.bytecode_len > available_bytes {
+                break;
+            }
+
+            let hash = queued_order
+                .pop_front()
+                .expect("queue front disappeared during flush");
+            let request = queued_requests
+                .remove(&hash)
+                .expect("queued request disappeared during flush");
+
+            batch_bytes += request.bytecode_len;
+            batch.push(BatchRequestGroup {
+                hash,
+                bytecode: request.bytecode,
+                bytecode_len: request.bytecode_len,
+                waiters: request.waiters,
+            });
+        }
+
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let message = serde_json::to_string(&WebsocketServerboundMessage::Decompile {
+            data: batch.iter().map(|request| request.bytecode.as_ref()).collect(),
+        })
+        .expect("failed to serialize decompile batch");
+
+        write.send(Message::Text(message.into())).await?;
+        *bytes_in_flight += batch_bytes;
+
+        for request in batch {
+            pending_requests.insert(
+                request.hash,
+                PendingRequestGroup {
+                    waiters: request.waiters,
+                    byte_size: request.bytecode_len,
+                },
+            );
+        }
+
+        Ok(())
+    }
+
+    fn complete_waiters(
+        waiters: Vec<oneshot::Sender<DecompilationResponse>>,
+        result: DecompilationResponse,
+    ) {
+        let mut result = Some(result);
+        let mut remaining_waiters = waiters.into_iter().peekable();
+
+        while let Some(waiter) = remaining_waiters.next() {
+            let response = if remaining_waiters.peek().is_some() {
+                result
+                    .as_ref()
+                    .expect("result unexpectedly missing before final waiter")
+                    .clone()
+            } else {
+                result
+                    .take()
+                    .expect("result unexpectedly missing for final waiter")
+            };
+
+            let _ = waiter.send(response);
+        }
+    }
+
+    pub async fn enqueue_request(
+        &self,
+        request: DecompilationRequest,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.decompile_tx.send(request).await?;
+        Ok(())
     }
 
     pub async fn decompile_batch(
@@ -240,7 +350,7 @@ impl Decompiler {
         requests: Vec<DecompilationRequest>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         for request in requests {
-            self.decompile_tx.send(request)?;
+            self.enqueue_request(request).await?;
         }
         Ok(())
     }
@@ -260,7 +370,7 @@ impl Decompiler {
             tx,
         };
 
-        self.decompile_tx.send(request)?;
+        self.enqueue_request(request).await?;
         let result = rx.await?;
         Ok(result)
     }
